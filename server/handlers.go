@@ -20,6 +20,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/sessions"
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/server/internal"
@@ -189,6 +190,67 @@ func (s *Server) handleAuthorization(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) getSession(r *http.Request, authReq storage.AuthRequest) *sessions.Session {
+	if authReq.ClientID == "" {
+		return nil
+	}
+	session, _ := s.sessionStore.Get(r, authReq.ClientID)
+	return session
+}
+
+func (s *Server) getSessionIdentity(session *sessions.Session) (connector.Identity, bool) {
+	var identity connector.Identity
+	identityRaw, ok := session.Values["identity"].([]byte)
+	if !ok {
+		return identity, false
+	}
+	err := json.Unmarshal(identityRaw, &identity)
+	if err != nil {
+		return identity, false
+	}
+	return identity, true
+}
+
+func (s *Server) sessionGetScopes(session *sessions.Session) map[string]bool {
+	scopesRaw, ok := session.Values["scopes"].([]byte)
+	if ok {
+		var scopes map[string]bool
+		err := json.Unmarshal(scopesRaw, &scopes)
+		if err == nil {
+			return scopes
+		}
+	}
+	return make(map[string]bool)
+}
+
+func (s *Server) sessionScopesApproved(session *sessions.Session, authReq storage.AuthRequest) bool {
+	// check all scopes are approved in the session
+	scopes := s.sessionGetScopes(session)
+	for _, wantedScope := range authReq.Scopes {
+		_, ok := scopes[wantedScope]
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) authenticateSession(w http.ResponseWriter, r *http.Request, authReq storage.AuthRequest) {
+	// add scopes of the request to session scopes after approval
+	session := s.getSession(r, authReq)
+	scopes := s.sessionGetScopes(session)
+	for _, wantedScope := range authReq.Scopes {
+		scopes[wantedScope] = true
+	}
+	var err error
+	session.Values["scopes"], err = json.Marshal(scopes)
+	if err != nil {
+		s.logger.Error("failed to marshal scopes", "err", err)
+	} else {
+		session.Save(r, w)
+	}
+}
+
 func (s *Server) handleConnectorLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	authReq, err := s.parseAuthorizationRequest(r)
@@ -266,15 +328,49 @@ func (s *Server) handleConnectorLogin(w http.ResponseWriter, r *http.Request) {
 			}
 			http.Redirect(w, r, callbackURL, http.StatusFound)
 		case connector.PasswordConnector:
-			loginURL := url.URL{
-				Path: s.absPath("/auth", connID, "login"),
-			}
-			q := loginURL.Query()
-			q.Set("state", authReq.ID)
-			q.Set("back", backLink)
-			loginURL.RawQuery = q.Encode()
+			session := s.getSession(r, *authReq)
+			identity, idFound := s.getSessionIdentity(session)
 
-			http.Redirect(w, r, loginURL.String(), http.StatusFound)
+			if !idFound {
+				// no session id, do password request
+				loginURL := url.URL{
+					Path: s.absPath("/auth", connID, "login"),
+				}
+				q := loginURL.Query()
+				q.Set("state", authReq.ID)
+				q.Set("back", backLink)
+				loginURL.RawQuery = q.Encode()
+
+				http.Redirect(w, r, loginURL.String(), http.StatusFound)
+			} else {
+				// session id found skip the password prompt
+				redirectURL, canSkipApproval, err := s.finalizeLogin(ctx, identity, *authReq, conn)
+				if err != nil {
+					s.logger.Error("Failed to finalize login", "err", err)
+					s.renderError(r, w, http.StatusInternalServerError, "Login error.")
+					return
+				}
+				var hasApproval bool
+				if canSkipApproval {
+					hasApproval = true
+				} else {
+					// if all scopes are approved end, else ask for approval for new scopes
+					hasApproval = s.sessionScopesApproved(session, *authReq)
+				}
+				if hasApproval {
+					authReq, err := s.storage.GetAuthRequest(authReq.ID)
+					if err != nil {
+						s.logger.Error("Failed to get updated request", "err", err)
+						s.renderError(r, w, http.StatusInternalServerError, "Login error.")
+						return
+					} else {
+						s.sendCodeResponse(w, r, authReq)
+						return
+					}
+				} else {
+					http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+				}
+			}
 		case connector.SAMLConnector:
 			action, value, err := conn.POSTData(scopes, authReq.ID)
 			if err != nil {
@@ -383,6 +479,15 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 			s.logger.Error("failed to finalize login", "err", err)
 			s.renderError(r, w, http.StatusInternalServerError, "Login error.")
 			return
+		}
+
+		// store identity in session
+		session := s.getSession(r, authReq)
+		session.Values["identity"], err = json.Marshal(identity)
+		if err != nil {
+			s.logger.Error("failed to marshal identity", "err", err)
+		} else {
+			session.Save(r, w)
 		}
 
 		if canSkipApproval {
@@ -646,6 +751,7 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 			s.renderError(r, w, http.StatusInternalServerError, "Approval rejected.")
 			return
 		}
+		s.authenticateSession(w, r, authReq)
 		s.sendCodeResponse(w, r, authReq)
 	}
 }
